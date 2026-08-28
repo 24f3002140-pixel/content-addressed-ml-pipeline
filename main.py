@@ -62,44 +62,15 @@ STATUSES = {
 }
 
 LOCK = threading.RLock()
-
-# ------------------------------------------------------------------
-# Persistent process state, isolated by session.
-# ------------------------------------------------------------------
-
 SESSIONS = {}
 
 
-def new_session():
-    return {
-        "revision": None,
-        "inputs": None,
+def err(code):
+    return JSONResponse(
+        status_code=409,
+        content={"error": code},
+    )
 
-        # Only accepted event IDs are stored here.
-        "events": {},
-
-        # Current execution state.
-        "state": {
-            node: None
-            for node in DAG
-        },
-
-        # Immutable successful content-addressed evidence.
-        #
-        # cache[node][key] = {
-        #     "artifactDigest": "...",
-        #     "eventId": "..."
-        # }
-        "cache": {
-            node: {}
-            for node in DAG
-        },
-    }
-
-
-# ------------------------------------------------------------------
-# JSON / hashing
-# ------------------------------------------------------------------
 
 def compact_json(value):
     return json.dumps(
@@ -116,9 +87,7 @@ def sha256_utf8(value):
 
 
 def content_key(values):
-    return sha256_utf8(
-        compact_json(values)
-    )
+    return sha256_utf8(compact_json(values))
 
 
 def safe_positive_int(value):
@@ -136,39 +105,53 @@ def nonempty_string(value):
     )
 
 
-def conflict(code):
-    return JSONResponse(
-        status_code=409,
-        content={"error": code},
-    )
+def new_session():
+    return {
+        "revision": None,
+        "inputs": None,
+
+        "events": {},
+
+        "state": {
+            node: None
+            for node in DAG
+        },
+
+        "cache": {
+            node: {}
+            for node in DAG
+        },
+    }
 
 
-# ------------------------------------------------------------------
-# Request validation
-# ------------------------------------------------------------------
+# ================================================================
+# REQUEST VALIDATION
+# ================================================================
 
 def valid_request(body):
     if not isinstance(body, dict):
         return False
 
-    if set(body.keys()) != {
+    required = {
         "session",
         "revision",
         "inputs",
         "events",
-    }:
+    }
+
+    if not required.issubset(body.keys()):
         return False
 
-    if not nonempty_string(body["session"]):
+    if not nonempty_string(body.get("session")):
         return False
 
-    if not safe_positive_int(body["revision"]):
+    if not safe_positive_int(body.get("revision")):
         return False
 
-    if not isinstance(body["inputs"], dict):
+    if not isinstance(body.get("inputs"), dict):
         return False
 
-    if not isinstance(body["events"], list):
+    if not isinstance(body.get("events"), list):
         return False
 
     for name in INPUTS:
@@ -193,7 +176,7 @@ def valid_event(event):
     if not safe_positive_int(event["revision"]):
         return False
 
-    if not nonempty_string(event["node"]):
+    if event["node"] not in DAG:
         return False
 
     if not safe_positive_int(event["attempt"]):
@@ -214,9 +197,11 @@ def valid_event(event):
         if event["artifactDigest"] is not None:
             return False
 
-    # Receipt is required only for successful register/publish.
     if (
-        event["node"] in ("register", "publish")
+        event["node"] in {
+            "register",
+            "publish",
+        }
         and event["status"] == "succeeded"
     ):
         expected = (
@@ -249,17 +234,15 @@ def canonical_event(event):
 
 
 def canonical_inputs(inputs):
-    # Complete object, including any extra metadata.
     return compact_json(inputs)
 
 
-# ------------------------------------------------------------------
-# Exact dependency arrays.
-#
-# These are deliberately kept in the specification's order.
-# ------------------------------------------------------------------
+# ================================================================
+# EXACT CONTENT-ADDRESSED DEPENDENCY ARRAYS
+# ================================================================
 
 def dependency_array(node, inputs, artifacts):
+
     if node == "verify_data":
         return [
             inputs["generation"],
@@ -304,12 +287,9 @@ def dependency_array(node, inputs, artifacts):
     return None
 
 
-# ------------------------------------------------------------------
-# Current reusable cache chain.
-#
-# A downstream key is NEVER calculated until the parent has a
-# successful reusable cache entry.
-# ------------------------------------------------------------------
+# ================================================================
+# RECOVER REUSABLE CONTENT-ADDRESSED CHAIN
+# ================================================================
 
 def recover(session, inputs):
     artifacts = {}
@@ -320,7 +300,6 @@ def recover(session, inputs):
         parent = PARENT[node]
 
         if parent is not None:
-            # Parent must have been successfully recovered.
             if parent not in artifacts:
                 keys[node] = None
                 break
@@ -336,7 +315,6 @@ def recover(session, inputs):
             break
 
         key = content_key(deps)
-
         keys[node] = key
 
         cached = session["cache"][node].get(key)
@@ -351,9 +329,9 @@ def recover(session, inputs):
     return artifacts, keys
 
 
-# ------------------------------------------------------------------
-# Response dependency object.
-# ------------------------------------------------------------------
+# ================================================================
+# RESPONSE DEPENDENCIES
+# ================================================================
 
 def dependency_object(
     node,
@@ -413,16 +391,15 @@ def dependency_object(
     else:
         result = {}
 
-    # cacheKey comes after all named dependencies.
     if key is not None:
         result["cacheKey"] = key
 
     return result
 
 
-# ------------------------------------------------------------------
-# Parent gating.
-# ------------------------------------------------------------------
+# ================================================================
+# PARENT AVAILABILITY
+# ================================================================
 
 def parent_reusable(session, inputs, node):
     parent = PARENT[node]
@@ -441,15 +418,14 @@ def parent_reusable(session, inputs, node):
     )
 
 
-# ------------------------------------------------------------------
-# Successful immutable evidence.
-# ------------------------------------------------------------------
+# ================================================================
+# SUCCESSFUL IMMUTABLE EVIDENCE
+# ================================================================
 
 def save_success(session, event):
     node = event["node"]
     key = event["key"]
 
-    # First evidence wins permanently.
     if key not in session["cache"][node]:
         session["cache"][node][key] = {
             "artifactDigest": event[
@@ -469,11 +445,12 @@ def save_success(session, event):
     }
 
 
-# ------------------------------------------------------------------
-# State transition.
-# ------------------------------------------------------------------
+# ================================================================
+# EVENT TRANSITIONS
+# ================================================================
 
 def transition(session, event):
+
     node = event["node"]
     key = event["key"]
     status = event["status"]
@@ -481,9 +458,9 @@ def transition(session, event):
 
     cached = session["cache"][node].get(key)
 
-    # --------------------------------------------------------------
-    # Existing successful immutable evidence.
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Immutable successful evidence
+    # ------------------------------------------------------------
 
     if cached is not None:
 
@@ -498,7 +475,6 @@ def transition(session, event):
                     "EVIDENCE_CONFLICT",
                 )
 
-            # Exact successful evidence is replayable.
             return "ignore", None
 
         return (
@@ -508,9 +484,9 @@ def transition(session, event):
 
     current = session["state"][node]
 
-    # --------------------------------------------------------------
-    # No current attempt.
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # No previous state
+    # ------------------------------------------------------------
 
     if current is None:
 
@@ -527,20 +503,18 @@ def transition(session, event):
 
             return "accept", None
 
-        # Completion without started(1), or attempt > 1:
-        # ignored.
         return "ignore", None
 
-    # Different key is stale.
+    # Different content key is stale.
     if current["key"] != key:
         return "ignore", None
 
     previous = current["status"]
     previous_attempt = current["attempt"]
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
     # started(n)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
 
     if previous == "started":
 
@@ -576,9 +550,9 @@ def transition(session, event):
             "STATUS_CONFLICT",
         )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
     # retryable_failed(n)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
 
     if previous == "retryable_failed":
 
@@ -603,17 +577,17 @@ def transition(session, event):
             "STATUS_CONFLICT",
         )
 
-    # --------------------------------------------------------------
-    # succeeded / terminal_failed
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Terminal / succeeded are immutable state.
+    # ------------------------------------------------------------
 
-    if previous == "succeeded":
+    if previous == "terminal_failed":
         return (
             "conflict",
             "STATUS_CONFLICT",
         )
 
-    if previous == "terminal_failed":
+    if previous == "succeeded":
         return (
             "conflict",
             "STATUS_CONFLICT",
@@ -625,11 +599,12 @@ def transition(session, event):
     )
 
 
-# ------------------------------------------------------------------
-# Response generation.
-# ------------------------------------------------------------------
+# ================================================================
+# RESPONSE
+# ================================================================
 
 def build_nodes(session, inputs):
+
     artifacts, keys = recover(
         session,
         inputs,
@@ -637,23 +612,25 @@ def build_nodes(session, inputs):
 
     result = []
 
-    upstream_reason = None
-    upstream_ids = []
+    blocking_reason = None
+    blocking_ids = []
 
     for index, node in enumerate(DAG):
 
         key = keys.get(node)
 
-        # ----------------------------------------------------------
-        # Parent-gated key is unavailable.
-        # ----------------------------------------------------------
+        # --------------------------------------------------------
+        # Parent isn't reusable.
+        # --------------------------------------------------------
 
         if key is None:
 
-            if upstream_reason == "TERMINAL_FAILURE":
-                reason = "UPSTREAM_TERMINAL"
-            else:
-                reason = "UPSTREAM_PENDING"
+            reason = (
+                "UPSTREAM_TERMINAL"
+                if blocking_reason
+                == "TERMINAL_FAILURE"
+                else "UPSTREAM_PENDING"
+            )
 
             result.append({
                 "node": node,
@@ -667,14 +644,14 @@ def build_nodes(session, inputs):
                         None,
                     ),
                 "triggeringEventIds":
-                    upstream_ids,
+                    blocking_ids,
             })
 
             continue
 
-        # ----------------------------------------------------------
-        # Successful cache.
-        # ----------------------------------------------------------
+        # --------------------------------------------------------
+        # Cache hit.
+        # --------------------------------------------------------
 
         cached = session["cache"][node].get(key)
 
@@ -700,9 +677,9 @@ def build_nodes(session, inputs):
 
             continue
 
-        # ----------------------------------------------------------
+        # --------------------------------------------------------
         # Current execution state.
-        # ----------------------------------------------------------
+        # --------------------------------------------------------
 
         current = session["state"][node]
 
@@ -754,11 +731,17 @@ def build_nodes(session, inputs):
             "triggeringEventIds": ids,
         })
 
-        # Every descendant is now upstream-blocked.
-        upstream_reason = reason
-        upstream_ids = ids
+        blocking_reason = reason
+        blocking_ids = ids
+
+        # --------------------------------------------------------
+        # Remaining descendants are blocked.
+        # --------------------------------------------------------
 
         for later in DAG[index + 1:]:
+
+            later_key = keys.get(later)
+
             result.append({
                 "node": later,
                 "action": "block",
@@ -772,7 +755,7 @@ def build_nodes(session, inputs):
                         later,
                         inputs,
                         artifacts,
-                        None,
+                        later_key,
                     ),
                 "triggeringEventIds": ids,
             })
@@ -782,9 +765,9 @@ def build_nodes(session, inputs):
     return result
 
 
-# ------------------------------------------------------------------
-# POST /pipeline
-# ------------------------------------------------------------------
+# ================================================================
+# PIPELINE
+# ================================================================
 
 @app.post("/pipeline")
 async def pipeline(request: Request):
@@ -802,7 +785,7 @@ async def pipeline(request: Request):
     inputs = body["inputs"]
     events = body["events"]
 
-    # Validate all event structures before beginning transaction.
+    # Validate event structure before mutating anything.
     for event in events:
         if not valid_event(event):
             return err("INVALID_EVENT")
@@ -816,71 +799,75 @@ async def pipeline(request: Request):
         if current is None:
             current = new_session()
 
-        # ==========================================================
-        # REVISION
-        # ==========================================================
+        # ========================================================
+        # OLD REVISION
+        # ========================================================
 
-        if current["revision"] is not None:
+        if (
+            current["revision"] is not None
+            and revision < current["revision"]
+        ):
 
-            # Older revision:
-            # completely ignored, no IDs consumed.
-            if revision < current["revision"]:
+            old_inputs = json.loads(
+                current["inputs"]
+            )
 
-                old_inputs = json.loads(
-                    current["inputs"]
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "revision": current[
+                        "revision"
+                    ],
+                    "acceptedEventIds": [],
+                    "ignoredEventIds": [
+                        e["eventId"]
+                        for e in events
+                    ],
+                    "nodes": build_nodes(
+                        current,
+                        old_inputs,
+                    ),
+                },
+            )
+
+        # ========================================================
+        # SAME REVISION
+        # ========================================================
+
+        if (
+            current["revision"] is not None
+            and revision == current["revision"]
+        ):
+
+            if (
+                canonical_inputs(inputs)
+                != current["inputs"]
+            ):
+                return err(
+                    "REVISION_CONFLICT"
                 )
 
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "revision": current[
-                            "revision"
-                        ],
-                        "acceptedEventIds": [],
-                        "ignoredEventIds": [
-                            e["eventId"]
-                            for e in events
-                        ],
-                        "nodes": build_nodes(
-                            current,
-                            old_inputs,
-                        ),
-                    },
-                )
-
-            # Same revision requires identical complete inputs,
-            # including extra metadata.
-            if revision == current["revision"]:
-
-                if (
-                    canonical_inputs(inputs)
-                    != current["inputs"]
-                ):
-                    return err(
-                        "REVISION_CONFLICT"
-                    )
-
-        # ==========================================================
-        # TRANSACTIONAL COPY
-        # ==========================================================
+        # ========================================================
+        # ATOMIC COPY
+        # ========================================================
 
         working = copy.deepcopy(current)
 
-        # ==========================================================
+        # ========================================================
         # NEW REVISION
-        # ==========================================================
+        # ========================================================
 
         if (
             working["revision"] is None
             or revision > working["revision"]
         ):
 
-            # Preserve ONLY successful cache.
+            # Cache survives.
             old_cache = copy.deepcopy(
                 working["cache"]
             )
 
-            # Clear attempts, terminal state, and event IDs.
+            # Attempt state and event IDs do not.
             working = new_session()
 
             working["revision"] = revision
@@ -890,6 +877,7 @@ async def pipeline(request: Request):
             working["cache"] = old_cache
 
         else:
+
             working["revision"] = revision
             working["inputs"] = (
                 canonical_inputs(inputs)
@@ -898,24 +886,24 @@ async def pipeline(request: Request):
         accepted = []
         ignored = []
 
-        # ==========================================================
-        # EVENT BATCH
-        # ==========================================================
+        # ========================================================
+        # PROCESS EVENTS IN INPUT ORDER
+        # ========================================================
 
         for event in events:
 
             event_id = event["eventId"]
 
-            # Wrong revision is ignored.
+            # Wrong revision = ignore.
             if event["revision"] != revision:
                 ignored.append(event_id)
                 continue
 
-            canonical = event_canonical(event)
+            canonical = canonical_event(event)
 
-            # ======================================================
-            # EVENT ID
-            # ======================================================
+            # ----------------------------------------------------
+            # Event ID already known.
+            # ----------------------------------------------------
 
             if event_id in working["events"]:
 
@@ -923,7 +911,6 @@ async def pipeline(request: Request):
                     working["events"][event_id]
                     == canonical
                 ):
-                    # Exact replay.
                     ignored.append(event_id)
                     continue
 
@@ -933,14 +920,9 @@ async def pipeline(request: Request):
 
             node = event["node"]
 
-            # Unknown node is ignored rather than creating state.
-            if node not in DAG:
-                ignored.append(event_id)
-                continue
-
-            # ======================================================
-            # PARENT GATE
-            # ======================================================
+            # ----------------------------------------------------
+            # Parent must be reusable.
+            # ----------------------------------------------------
 
             if not parent_reusable(
                 working,
@@ -950,28 +932,28 @@ async def pipeline(request: Request):
                 ignored.append(event_id)
                 continue
 
-            # ======================================================
-            # EXACT CURRENT KEY
-            # ======================================================
+            # ----------------------------------------------------
+            # Event key must be current content key.
+            # ----------------------------------------------------
 
             reusable, keys = recover(
                 working,
                 inputs,
             )
 
-            expected = keys.get(node)
+            expected_key = keys.get(node)
 
-            if expected is None:
+            if expected_key is None:
                 ignored.append(event_id)
                 continue
 
-            if event["key"] != expected:
+            if event["key"] != expected_key:
                 ignored.append(event_id)
                 continue
 
-            # ======================================================
-            # TRANSITION
-            # ======================================================
+            # ----------------------------------------------------
+            # Transition.
+            # ----------------------------------------------------
 
             outcome, code = transition(
                 working,
@@ -979,7 +961,7 @@ async def pipeline(request: Request):
             )
 
             if outcome == "conflict":
-                # Do NOT commit working.
+                # Atomic rollback.
                 return err(code)
 
             if outcome == "accept":
@@ -991,12 +973,12 @@ async def pipeline(request: Request):
                 accepted.append(event_id)
 
             else:
-                # Ignored IDs remain unused.
+                # Important: ignored events do NOT consume IDs.
                 ignored.append(event_id)
 
-        # ==========================================================
-        # ATOMIC COMMIT
-        # ==========================================================
+        # ========================================================
+        # COMMIT
+        # ========================================================
 
         SESSIONS[session_id] = working
 
